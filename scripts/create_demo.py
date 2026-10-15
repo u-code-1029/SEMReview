@@ -11,7 +11,8 @@ import tifffile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from semreview.core import scan  # noqa: E402
-from semreview.project import DEFAULT_CLASSES, DEFAULT_PROFILES, Project, sequence_signature  # noqa: E402
+from semreview.classdefs import class_ids, legacy_definitions, LEGACY_DEFAULT_NAMES  # noqa: E402
+from semreview.project import DEFAULT_PROFILES, Project, sequence_signature  # noqa: E402
 
 
 def create_demo(destination: Path, width=768, height=512, folders=2, frames=24):
@@ -40,14 +41,18 @@ def create_demo(destination: Path, width=768, height=512, folders=2, frames=24):
                 tifffile.imwrite(leaf / f"{frame + 1}.tif", image, compression="deflate", photometric="minisblack")
     sequences = scan(str(base), DEFAULT_PROFILES)
     project_dir = destination / "project"
+    definitions = legacy_definitions(LEGACY_DEFAULT_NAMES)
+    for definition in definitions:
+        definition["description"] = f"합성 데이터에서 {definition['name']} 상태가 처음 나타나는 이미지"
+    classes = class_ids(definitions)
     with Project(project_dir) as project:
         project.set("base", str(base.resolve()))
         project.set("profiles", DEFAULT_PROFILES)
-        project.set("classes", DEFAULT_CLASSES)
+        project.update_class_definitions(definitions)
         project.set("sequences", sequences)
         project.set("demo", True)
         for sequence in sequences:
-            project.save_annotation(sequence["relative_path"], dict(zip(DEFAULT_CLASSES, [3, 9, 16])),
+            project.save_annotation(sequence["relative_path"], dict(zip(classes, [3, 9, 16])),
                                     sequence_signature(sequence), "complete", 3)
     return project_dir
 

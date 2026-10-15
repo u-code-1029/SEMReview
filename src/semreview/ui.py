@@ -11,9 +11,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QLabel, QPushButton, QFileDialog, QMessageBox, QDialog, QDialogButtonBox, QTabWidget,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QListWidget, QListWidgetItem, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QProgressBar,
-    QFormLayout, QPlainTextEdit, QInputDialog, QStackedWidget)
+    QFormLayout, QPlainTextEdit, QInputDialog, QStackedWidget, QAbstractButton)
 
 from .project import Project, DEFAULT_CLASSES, DEFAULT_PROFILES, sequence_signature
+from .classdefs import definitions_for_metadata
+from .class_editor import ClassDefinitionsDialog
 from .jobs import JobController
 from .widgets import SequenceEditor
 
@@ -82,7 +84,7 @@ class SettingsDialog(QDialog):
     """Editable traversal profiles: one exact depth per profile; multiple depths supported."""
     def __init__(self,project,parent=None):
         super().__init__(parent)
-        self.setWindowTitle('프로젝트 설정 · 폴더 탐색과 클래스')
+        self.setWindowTitle('프로젝트 설정 · 폴더 탐색과 학습 장치')
         self.resize(760,600)
         self.profiles=json.loads(json.dumps(project.get('profiles',DEFAULT_PROFILES)))
         self._current=-1
@@ -112,8 +114,6 @@ class SettingsDialog(QDialog):
         row.addStretch()
         layout.addLayout(row)
         form=QFormLayout()
-        self.class_names=QLineEdit(', '.join(project.get('classes',DEFAULT_CLASSES)))
-        form.addRow('순서가 있는 클래스',self.class_names)
         self.group_depth=QSpinBox()
         self.group_depth.setRange(1,30)
         self.group_depth.setValue(project.get('group_depth',1))
@@ -131,7 +131,7 @@ class SettingsDialog(QDialog):
         weights_row.addWidget(_button('찾아보기',self._browse_weights))
         form.addRow('로컬 사전학습 가중치',weights_row)
         layout.addLayout(form)
-        note=QLabel('클래스는 바닥부터 마지막 천장 순서로 쉼표로 구분합니다.\n클래스 구성을 바꾸면 기존 라벨을 다시 확인해야 합니다. 저장된 모델의 클래스는 유지됩니다.')
+        note=QLabel('학습할 상태의 이름·순서·정의는 메인 화면의 클래스 정의에서 관리합니다.')
         note.setObjectName('muted')
         layout.addWidget(note)
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -206,10 +206,6 @@ class SettingsDialog(QDialog):
 
     def accept(self):
         self._store_profile()
-        self.classes=[name.strip() for name in self.class_names.text().split(',') if name.strip()]
-        if not 2<=len(self.classes)<=64 or len(set(self.classes))!=len(self.classes):
-            QMessageBox.warning(self,'클래스 확인','서로 다른 클래스 이름을 바닥과 천장 순서로 2~64개 입력하세요.')
-            return
         if any(not p['levels'] for p in self.profiles):
             QMessageBox.warning(self,'탐색 단계 확인','각 프로필에 최소 한 개의 하위 단계를 추가하세요.')
             return
@@ -273,6 +269,8 @@ class MainWindow(QMainWindow):
         top.addStretch()
         top.addWidget(_button('프로젝트 열기',self.open_project_dialog))
         top.addWidget(_button('새 프로젝트',self.create_project_dialog))
+        self.classes_button=_button('클래스 정의',self.edit_class_definitions,True)
+        top.addWidget(self.classes_button)
         self.settings_button=_button('설정',self.settings)
         top.addWidget(self.settings_button)
         layout.addLayout(top)
@@ -334,10 +332,18 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.cancel_button)
         layout.addLayout(footer)
         self.settings_button.setEnabled(False)
+        self.classes_button.setEnabled(False)
 
     def _training_page(self):
         page=QWidget()
         layout=QVBoxLayout(page)
+        definition_row=QHBoxLayout()
+        self.classes_summary=QLabel('학습할 클래스를 정의하세요')
+        self.classes_summary.setWordWrap(True)
+        definition_row.addWidget(self.classes_summary,1)
+        self.training_classes_button=_button('클래스 편집',self.edit_class_definitions)
+        definition_row.addWidget(self.training_classes_button)
+        layout.addLayout(definition_row)
         split=QSplitter(Qt.Orientation.Horizontal)
         queue=QWidget()
         ql=QVBoxLayout(queue)
@@ -417,7 +423,7 @@ class MainWindow(QMainWindow):
         self.infer_button=_button('전체 폴더 분석',self.infer,True)
         row.addWidget(self.infer_button)
         layout.addLayout(row)
-        note=QLabel('바닥부터 끝점까지 모든 이미지를 보존합니다. 결과를 확인하고 체크한 폴더만 격리 이동합니다.')
+        note=QLabel('모델의 첫 클래스부터 선택한 끝점까지 모든 이미지를 보존합니다. 결과를 확인하고 체크한 폴더만 격리 이동합니다.')
         note.setObjectName('muted')
         layout.addWidget(note)
         split=QSplitter(Qt.Orientation.Vertical)
@@ -535,7 +541,7 @@ class MainWindow(QMainWindow):
             self.rule_jobs.cancel()
             self.rules_relative=None
             self._loading=True
-            self.editor.set_sequence(None,project.get('classes',DEFAULT_CLASSES))
+            self.editor.set_sequence(None,project.get('classes',DEFAULT_CLASSES),class_definitions=project.class_definitions())
             self.review_editor.set_sequence(None,[])
             self.base_path.setText(project.get('base',''))
             self.sequences=project.get('sequences',[])
@@ -545,6 +551,8 @@ class MainWindow(QMainWindow):
             self.project_label.setText(str(project.root))
             self.stack.setCurrentIndex(1)
             self.settings_button.setEnabled(True)
+            self.classes_button.setEnabled(True)
+            self._refresh_class_summary()
             self._refresh_queue()
             self._refresh_models()
             self._refresh_runs()
@@ -569,20 +577,38 @@ class MainWindow(QMainWindow):
         dialog=SettingsDialog(self.project,self)
         if dialog.exec()!=QDialog.DialogCode.Accepted:
             return
-        old_classes=self.project.get('classes',DEFAULT_CLASSES)
         self.project.set('profiles',dialog.profiles)
-        self.project.set('classes',dialog.classes)
         self.project.set('group_depth',dialog.group_depth.value())
         self.project.set('training_config',dialog.training_config)
-        if old_classes!=dialog.classes:
-            for relative,annotation in self.annotations.items():
-                filtered={k:v for k,v in annotation['landmarks'].items() if k in dialog.classes}
-                self.project.save_annotation(relative,filtered,annotation['sequence_signature'],'draft',annotation['cursor'])
+        self.status.setText('설정을 저장했습니다. 탐색 / 새로고침을 누르면 폴더 규칙이 적용됩니다.')
+
+    def _refresh_class_summary(self):
+        definitions=self.project.class_definitions()
+        names=[item['name'] for item in definitions]
+        preview=' → '.join(names[:5])
+        if len(names)>5:
+            preview+=f' → … +{len(names)-5}개'
+        self.classes_summary.setText(f'학습 클래스 {len(names)}개 · {preview}')
+        self.classes_summary.setToolTip('\n'.join(f'{i+1}. {item["name"]} — {item["description"]}' for i,item in enumerate(definitions)))
+
+    def edit_class_definitions(self):
+        if not self.project or self.busy:
+            return
+        dialog=ClassDefinitionsDialog(self.project.class_definitions(),self)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.project.update_class_definitions(dialog.definitions)
             self.annotations=self.project.annotations()
+            self._refresh_class_summary()
             self._refresh_queue()
             if self.current_sequence:
                 self._load_training_sequence(self.current_sequence)
-        self.status.setText('설정을 저장했습니다. 탐색 / 새로고침을 누르면 폴더 규칙이 적용됩니다.')
+            else:
+                self.editor.set_sequence(None,self.project.get('classes'),class_definitions=self.project.class_definitions())
+            self.status.setText('클래스 정의를 저장했습니다. 저장된 모델은 학습 당시의 정의로 검수합니다.')
+        except Exception as exc:
+            self._show_error('클래스 정의 저장 실패',exc)
 
     def choose_base(self):
         if not self.project or self.busy:
@@ -662,7 +688,7 @@ class MainWindow(QMainWindow):
         ann=self.annotations.get(relative,{})
         stale=ann and ann.get('sequence_signature')!=sequence_signature(sequence)
         landmarks={} if stale else ann.get('landmarks',{})
-        self.editor.set_sequence(sequence,self.project.get('classes',DEFAULT_CLASSES),landmarks,ann.get('cursor',0))
+        self.editor.set_sequence(sequence,self.project.get('classes',DEFAULT_CLASSES),landmarks,ann.get('cursor',0),class_definitions=self.project.class_definitions())
         self.project.set('current_folder',relative)
         if stale:
             self.editor.warning.setText('원본 파일이 변경되었습니다. 기준점을 다시 지정하고 확인하세요.')
@@ -773,6 +799,7 @@ class MainWindow(QMainWindow):
         self._start('train',{'project_dir':str(self.project.root),'sequences':sequences,
             'annotations':{s['relative_path']:self.annotations[s['relative_path']]['landmarks'] for s in sequences},
             'classes':self.project.get('classes',DEFAULT_CLASSES),'model_name':self.model_name.text().strip() or 'SEM 경계 모델',
+            'class_definitions':self.project.class_definitions(),
             'config':{**self.project.get('training_config',{}),'allow_download':self.allow_download.isChecked(),'group_level':self.project.get('group_depth',1)}})
 
     def _refresh_models(self):
@@ -787,7 +814,7 @@ class MainWindow(QMainWindow):
         for row,model in enumerate(self.models):
             name=model.get('name',model.get('model_name',model.get('id','모델')))
             self.review_model.addItem(name,model)
-            for col,value in enumerate([name,' → '.join(model.get('classes',[])),model.get('created_at',''),model.get('id','')]):
+            for col,value in enumerate([name,' → '.join(item['name'] for item in definitions_for_metadata(model)),model.get('created_at',''),model.get('id','')]):
                 self.model_table.setItem(row,col,QTableWidgetItem(str(value)))
             if model.get('id')==selected_id:
                 self.review_model.setCurrentIndex(row)
@@ -805,21 +832,24 @@ class MainWindow(QMainWindow):
             self.metrics_table.setRowCount(0)
             return
         model=self.models[row]
+        definitions=definitions_for_metadata(model)
+        names={item['id']:item['name'] for item in definitions}
         metrics=model.get('metrics',{})
         by_class=metrics.get('by_class',{})
         self.metrics_table.setRowCount(len(by_class))
         for metric_row,(name,values) in enumerate(by_class.items()):
-            display=[name,f'{values.get("mae",0):.2f}장',f'{values.get("exact",0):.1%}',f'{values.get("within_1",0):.1%}',f'{values.get("within_3",0):.1%}']
+            display=[names.get(name,name),f'{values.get("mae",0):.2f}장',f'{values.get("exact",0):.1%}',f'{values.get("within_1",0):.1%}',f'{values.get("within_3",0):.1%}']
             for col,value in enumerate(display):
                 self.metrics_table.setItem(metric_row,col,QTableWidgetItem(value))
         if metrics.get('validated'):
             self.metrics_summary.setText(f'그룹별 {metrics.get("folds",3)}분할 검증 · {metrics.get("folders",0)}개 폴더\n'
                 f'필요 이미지 누락 {metrics.get("missed_images",0)}장 · 불필요 이미지 보존 {metrics.get("extra_images",0)}장 · '
                 f'경계 수정이 필요한 폴더 {metrics.get("folders_needing_correction",0):.1%}\n'
-                f'평가 보존 기준: {metrics.get("end_class","")} + {metrics.get("offset",30)}장')
+                f'평가 보존 기준: {names.get(metrics.get("end_class"),metrics.get("end_class",""))} + {metrics.get("offset",30)}장')
         else:
             self.metrics_summary.setText('일반화 성능 미검증 · '+metrics.get('reason','검증 결과가 없습니다. 실제 SEM 데이터에서 성능을 확인하세요.'))
-        lines=[f'모델: {model.get("name",model.get("model_name",model.get("id","")))}',f'클래스: {" → ".join(model.get("classes",[]))}',f'위치: {model.get("path","")}','',
+        lines=[f'모델: {model.get("name",model.get("model_name",model.get("id","")))}',f'클래스: {" → ".join(item["name"] for item in definitions)}',f'위치: {model.get("path","")}','',
+            *[f'{index+1}. {item["name"]}: {item["description"]}' for index,item in enumerate(definitions)],'',
             '평가는 폴더 / 촬영 그룹을 분리하여 계산합니다. 높은 순위는 사용자 확인이 더 필요하다는 의미입니다.','',json.dumps({k:v for k,v in model.items() if k not in {'path','project_relative_path'}},ensure_ascii=False,indent=2)]
         self.model_details.setPlainText('\n'.join(lines))
 
@@ -851,15 +881,18 @@ class MainWindow(QMainWindow):
 
     def _review_model_changed(self,*args):
         model=self.review_model.currentData()
-        old=self.end_class.currentText()
+        old=self.end_class.currentData()
         self.end_class.blockSignals(True)
         self.end_class.clear()
         classes=model.get('classes',[]) if isinstance(model,dict) else []
-        self.end_class.addItems(classes)
+        definitions=definitions_for_metadata(model) if isinstance(model,dict) else []
+        for item in definitions:
+            self.end_class.addItem(item['name'],item['id'])
+            self.end_class.setItemData(self.end_class.count()-1,item['description'],Qt.ItemDataRole.ToolTipRole)
         self.end_class.setCurrentIndex(max(0,self.end_class.count()-1))
         remembered=self.project.get('review_end_class') if self.project else old
         if remembered in classes:
-            self.end_class.setCurrentText(remembered)
+            self.end_class.setCurrentIndex(self.end_class.findData(remembered))
         self.end_class.blockSignals(False)
         if self.project and isinstance(model,dict):
             self.project.set('review_model_id',model['id'])
@@ -872,7 +905,7 @@ class MainWindow(QMainWindow):
     def _review_options_changed(self,*args):
         if self.project and not self._loading:
             self.project.set('review_offset',self.offset.value())
-            self.project.set('review_end_class',self.end_class.currentText())
+            self.project.set('review_end_class',self.end_class.currentData())
             self._rebuild_plans()
 
     def infer(self):
@@ -901,11 +934,14 @@ class MainWindow(QMainWindow):
         from .core import make_review_plan
         model=self.review_model.currentData()
         classes=model.get('classes',[]) if isinstance(model,dict) else []
+        definitions=definitions_for_metadata(model) if isinstance(model,dict) else []
+        missing_boundary_errors={f'클래스 기준점이 없거나 범위를 벗어났습니다: {item["id"]}':
+            f'클래스 기준점이 없거나 범위를 벗어났습니다: {item["name"]}' for item in definitions}
         model_id=model.get('id') if isinstance(model,dict) else None
         self.plans=[]
         if not self.predictions:
             self.current_review=-1
-            self.review_editor.set_sequence(None,classes)
+            self.review_editor.set_sequence(None,classes,class_definitions=definitions_for_metadata(model) if isinstance(model,dict) else [])
         self.review_table.blockSignals(True)
         self.review_table.setRowCount(len(self.predictions))
         for row,prediction in enumerate(self.predictions):
@@ -914,8 +950,8 @@ class MainWindow(QMainWindow):
             errors=[]
             if sequence and classes:
                 try:
-                    plan=make_review_plan(self.base_path.text(),sequence,prediction.get('landmarks',{}),classes,self.end_class.currentText(),self.offset.value(),prediction.get('model_id','manual'))
-                    errors.extend(str(x) for x in plan.get('errors',[]))
+                    plan=make_review_plan(self.base_path.text(),sequence,prediction.get('landmarks',{}),classes,self.end_class.currentData(),self.offset.value(),prediction.get('model_id','manual'))
+                    errors.extend(missing_boundary_errors.get(str(x),str(x)) for x in plan.get('errors',[]))
                     if prediction.get('model_id')!=model_id:
                         errors.append('선택한 모델과 분석 모델이 다릅니다. 다시 분석하세요.')
                 except Exception as exc:
@@ -963,7 +999,7 @@ class MainWindow(QMainWindow):
         if not sequence or not isinstance(model,dict):
             return
         self._loading=True
-        self.review_editor.set_sequence(sequence,model.get('classes',[]),prediction.get('landmarks',{}),next(iter(prediction.get('landmarks',{}).values()),0))
+        self.review_editor.set_sequence(sequence,model.get('classes',[]),prediction.get('landmarks',{}),next(iter(prediction.get('landmarks',{}).values()),0),class_definitions=definitions_for_metadata(model))
         self.review_editor.set_analysis(prediction)
         plan=self.plans[row] if row<len(self.plans) else None
         self.review_editor.set_keep_range(plan.get('start') if plan else None,plan.get('end') if plan and not plan.get('errors') else None)
@@ -1071,7 +1107,7 @@ class MainWindow(QMainWindow):
     def _busy_changed(self,state):
         self.busy=state
         self.cancel_button.setEnabled(state or self.rule_busy)
-        for button in [self.scan_button,self.choose_base_button,self.settings_button,self.train_button,self.infer_button,self.resume_button,self.restore_button]:
+        for button in [self.scan_button,self.choose_base_button,self.settings_button,self.classes_button,self.training_classes_button,self.train_button,self.infer_button,self.resume_button,self.restore_button]:
             button.setEnabled(not state)
         self._update_review_summary()
         if self._closing and not state:
@@ -1121,7 +1157,7 @@ class MainWindow(QMainWindow):
                     self._folder_selected(self.folder_list.currentItem())
                 else:
                     self.current_sequence=None
-                    self.editor.set_sequence(None,self.project.get('classes',DEFAULT_CLASSES))
+                    self.editor.set_sequence(None,self.project.get('classes',DEFAULT_CLASSES),class_definitions=self.project.class_definitions())
                 self._rebuild_plans()
                 images=sum(len(s['images']) for s in self.sequences)
                 self.status.setText(f'탐색 완료 · {len(self.sequences)}개 폴더 · {images}장 · 설정에서 폴더 규칙을 조정할 수 있습니다.')
@@ -1192,6 +1228,16 @@ class MainWindow(QMainWindow):
             return super().eventFilter(obj,event)
         if key in (Qt.Key.Key_Left,Qt.Key.Key_Right):
             editor.move((-1 if key==Qt.Key.Key_Left else 1)*(10 if modifiers & Qt.KeyboardModifier.ShiftModifier else 1))
+            return True
+        if key in (Qt.Key.Key_Up,Qt.Key.Key_Down):
+            if not focus or not (focus is editor or editor.isAncestorOf(focus)) or isinstance(focus,QAbstractButton):
+                return super().eventFilter(obj,event)
+            editor.select_next_class(-1 if key==Qt.Key.Key_Up else 1)
+            return True
+        if key==Qt.Key.Key_Space:
+            if not focus or not (focus is editor or editor.isAncestorOf(focus)) or isinstance(focus,QAbstractButton):
+                return super().eventFilter(obj,event)
+            editor.assign_selected()
             return True
         if Qt.Key.Key_1<=key<=Qt.Key.Key_9:
             editor.assign_number(key-Qt.Key.Key_1)

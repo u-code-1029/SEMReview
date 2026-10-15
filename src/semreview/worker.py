@@ -30,7 +30,8 @@ def dispatch(command: str, payload: dict, progress: Callable, cancelled: Callabl
                 raise ValueError(f"이미지가 변경되어 라벨 재확인이 필요합니다: {sequence['relative_path']}")
         return train(payload["project_dir"], payload["sequences"], payload["annotations"],
                      payload["classes"], payload["model_name"], config=payload.get("config"),
-                     progress=progress, cancelled=cancelled)
+                     progress=progress, cancelled=cancelled,
+                     class_definitions=payload.get("class_definitions"))
     if command == "infer":
         from .ml import infer
         return infer(payload["model_path"], payload["sequences"], payload["project_dir"],

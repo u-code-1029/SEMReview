@@ -22,8 +22,10 @@ from safetensors.numpy import load as load_tensors, save as save_tensors
 from skimage.transform import resize
 
 from .imaging import _check_cancel, _report, normalize, read_grayscale, rule_analysis
+from .classdefs import (class_ids, class_name, definitions_for_metadata,
+                        normalize_model_metadata, remap_keys, validate_definitions)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 PREPROCESS_VERSION = "sem-folder-percentile-global768x512-six512-context3-v1"
 WEIGHT_URL = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
 WEIGHT_HASH_PREFIX = "f37072fd"
@@ -122,7 +124,7 @@ def _read_package(path) -> tuple[dict, dict[str, np.ndarray]]:
                 raise ValueError("모델 메타데이터가 너무 큽니다.")
             metadata = json.loads(archive.read("metadata.json"))
             payload = archive.read("weights.safetensors")
-        if not isinstance(metadata, dict) or metadata.get("format_version") != FORMAT_VERSION:
+        if not isinstance(metadata, dict) or metadata.get("format_version") not in {1, FORMAT_VERSION}:
             raise ValueError("지원하지 않는 모델 형식입니다.")
         if metadata.get("preprocess_version") != PREPROCESS_VERSION or metadata.get("architecture") != "resnet18-frozen":
             raise ValueError("지원하지 않는 모델 전처리 또는 인코더입니다.")
@@ -136,6 +138,8 @@ def _read_package(path) -> tuple[dict, dict[str, np.ndarray]]:
         if not isinstance(metadata.get("metrics"), dict):
             raise ValueError("모델 평가 정보가 없습니다.")
         _validate_display_metadata(metadata)
+        metadata = normalize_model_metadata(metadata)
+        classes = metadata["classes"]
         tensors = load_tensors(payload)
         required = ["head.weight", "head.mean", "head.std"]
         if any(k not in tensors for k in required) or not any(k.startswith("encoder.") for k in tensors):
@@ -460,8 +464,19 @@ def _validate_labels(sequences, annotations, classes):
 
 
 def train(project_dir: str, sequences: list[dict], annotations: dict, classes: list[str], model_name: str,
-          config: dict | None = None, progress=None, cancelled=None) -> dict:
+          config: dict | None = None, progress=None, cancelled=None, *, class_definitions=None) -> dict:
     config = dict(config or {})
+    if class_definitions is not None:
+        definitions = validate_definitions(class_definitions)
+        if classes != class_ids(definitions):
+            raise ValueError("학습 클래스 ID의 순서와 클래스 정의가 일치하지 않습니다.")
+    else:
+        definitions = definitions_for_metadata({"classes": classes})
+        mapping = dict(zip(classes, class_ids(definitions)))
+        annotations = {path: remap_keys(labels, mapping) for path, labels in annotations.items()}
+        if "end_class" in config:
+            config["end_class"] = mapping.get(config["end_class"], config["end_class"])
+        classes = class_ids(definitions)
     sequences, labels = _validate_labels(sequences, annotations, classes)
     _check_cancel(cancelled)
     encoder = _load_encoder(project_dir, config, progress, cancelled)
@@ -486,7 +501,8 @@ def train(project_dir: str, sequences: list[dict], annotations: dict, classes: l
     head = _fit(features, labels, len(classes), config, progress, cancelled)
     metadata = {"format_version": FORMAT_VERSION, "preprocess_version": PREPROCESS_VERSION,
                 "architecture": "resnet18-frozen", "id": uuid.uuid4().hex, "name": model_name.strip() or "SEM 모델",
-                "created_at": datetime.now(timezone.utc).isoformat(), "classes": list(classes), "metrics": metrics,
+                "created_at": datetime.now(timezone.utc).isoformat(), "classes": list(classes),
+                "class_definitions": definitions, "metrics": metrics,
                 "encoder_sha256": encoder.identity,
                 "training_config": {key: value for key, value in config.items() if key in {"epochs", "learning_rate", "regularization", "group_level", "end_class", "offset"}},
                 "training_data": {sequence["relative_path"]: {"signature": signature, "labels": labels[i]}
@@ -519,6 +535,7 @@ def infer(model_path: str, sequences: list[dict], project_dir: str, progress=Non
     state = {k.removeprefix("encoder."): v for k, v in tensors.items() if k.startswith("encoder.")}
     encoder = _Encoder(state)
     classes = metadata["classes"]
+    definitions = metadata["class_definitions"]
     results = []
     for index, sequence in enumerate(sequences):
         _check_cancel(cancelled)
@@ -534,16 +551,17 @@ def infer(model_path: str, sequences: list[dict], project_dir: str, progress=Non
             result["landmarks"] = dict(zip(classes, positions))
             margins, disagreements = [], []
             for cls, name in enumerate(classes):
+                display = class_name(name, definitions)
                 ranked = np.argsort(-logits[:, cls], kind="stable")
                 result["candidates"][name] = [int(i) for i in ranked[:5]]
                 margin = float(logits[ranked[0], cls] - logits[ranked[1], cls]) if len(ranked) > 1 else 0.0
                 margins.append(margin)
                 if positions[cls] != int(ranked[0]):
-                    result["warnings"].append(f"{name}: 클래스 순서 제약 때문에 단일 최고 후보와 다른 위치를 추천했습니다.")
+                    result["warnings"].append(f"{display}: 클래스 순서 제약 때문에 단일 최고 후보와 다른 위치를 추천했습니다.")
                 if margin < 0.25:
-                    result["warnings"].append(f"{name}: 후보 간 점수 차이가 작습니다.")
+                    result["warnings"].append(f"{display}: 후보 간 점수 차이가 작습니다.")
                 if cls > 0 and rules["candidates"] and min(abs(positions[cls] - p) for p in rules["candidates"]) > 3:
-                    disagreements.append(name)
+                    disagreements.append(display)
             if disagreements:
                 result["warnings"].append("규칙 변화 후보와 모델 경계가 다릅니다: " + ", ".join(disagreements))
             if rules["warnings"]:

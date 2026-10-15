@@ -24,7 +24,13 @@ import tifffile
 
 WEIGHT_URL = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
 WEIGHT_SHA256 = "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
-CLASSES = ["바닥", "1층 천장", "2층 천장"]
+CLASS_DEFINITIONS = [
+    {"id": f"boundary-{i + 1}", "name": f"사용자 단계 {i + 1}",
+     "description": f"합성 패턴의 {i + 1}번째 전환 시작점", "color": "#62d6bb"}
+    for i in range(12)
+]
+CLASSES = [definition["id"] for definition in CLASS_DEFINITIONS]
+FRAMES = 16
 PROFILES = [{"name": "Synthetic smoke test", "levels": [
     {"include": ["촬영*"], "exclude": []},
     {"include": ["패턴*"], "exclude": []},
@@ -71,11 +77,11 @@ def generate_images(output: Path) -> tuple[Path, Path]:
     for group in range(3):
         folder = base / f"촬영{group + 1}" / "패턴01"
         folder.mkdir(parents=True)
-        for index in range(12):
-            phase = 0 if index < 1 else 1 if index < 5 else 2 if index < 9 else 3
+        for index in range(FRAMES):
+            phase = min(index, len(CLASSES))
             shift = index % 3 + group * 2
             waves = np.sin((xx + shift) / 4.0) + np.cos((yy - shift) / 5.0)
-            image = waves * (22 + phase * 8) + 45 + phase * 32 + rng.normal(0, 3, xx.shape)
+            image = waves * (12 + phase * 2) + 40 + phase * 10 + rng.normal(0, 3, xx.shape)
             if phase >= 2:
                 image += 12 * np.cos((xx + yy + group * 2) / 8.0)
             tifffile.imwrite(folder / f"{index + 5}.tif", np.clip(image * 257, 0, 65535).astype(np.uint16),
@@ -178,22 +184,25 @@ def run(args) -> dict:
         assert len(sequences) == 3, "Expected exactly three discovered folders"
         for sequence in sequences:
             assert not sequence["issues"], sequence["issues"]
-            assert [image["number"] for image in sequence["images"]] == list(range(5, 17))
+            assert [image["number"] for image in sequence["images"]] == list(range(5, 5 + FRAMES))
         rules, timings["rules"] = worker(executable, output, env, "rules", "rules", {"sequence": sequences[0]})
-        assert len(rules["scores"]) == 12 and len(rules["shifts"]) == 12
-        assert rules["candidates"] and all(0 < index < 12 for index in rules["candidates"])
+        assert len(rules["scores"]) == FRAMES and len(rules["shifts"]) == FRAMES
+        assert rules["candidates"] and all(0 < index < FRAMES for index in rules["candidates"])
         project = output / "training-project"
-        annotations = {seq["relative_path"]: dict(zip(CLASSES, [1, 5, 9])) for seq in sequences}
+        annotations = {seq["relative_path"]: dict(zip(CLASSES, range(1, 13))) for seq in sequences}
         model, timings["train"] = worker(executable, output, env, "train", "train", {
             "project_dir": str(project), "sequences": sequences, "annotations": annotations,
-            "classes": CLASSES, "model_name": "Synthetic packaged app smoke test",
+            "classes": CLASSES, "class_definitions": CLASS_DEFINITIONS,
+            "model_name": "Synthetic packaged app smoke test · 12 custom classes",
             "config": {"pretrained_weights_path": str(weights), "device": "cpu", "epochs": 2, "offset": 0},
         })
         assert Path(model["path"]).is_file() and model["classes"] == CLASSES
+        assert model["class_definitions"] == CLASS_DEFINITIONS
         assert model["metrics"]["validated"] and model["metrics"]["folds"] == 3
         inspected, timings["inspect"] = worker(executable, output, env, "inspect", "inspect_model",
                                                {"model_path": model["path"]})
         assert inspected["id"] == model["id"] and inspected["classes"] == CLASSES
+        assert inspected["class_definitions"] == CLASS_DEFINITIONS
         # A separate project forces inference to decode images and extract fresh
         # features instead of merely reading the training feature cache.
         predictions, timings["infer"] = worker(executable, output, env, "infer", "infer", {
@@ -203,7 +212,8 @@ def run(args) -> dict:
         for prediction in predictions:
             assert set(prediction["landmarks"]) == set(CLASSES), prediction
             indices = [prediction["landmarks"][label] for label in CLASSES]
-            assert 0 <= indices[0] < indices[1] < indices[2] < 12, indices
+            assert 0 <= indices[0] and indices[-1] < FRAMES, indices
+            assert all(left < right for left, right in zip(indices, indices[1:])), indices
         full_sequences, timings["full_scan"] = worker(executable, output, env, "full-scan", "scan",
                                                       {"base": str(full_base), "profiles": PROFILES})
         assert len(full_sequences) == 1 and len(full_sequences[0]["images"]) == 1
@@ -211,7 +221,8 @@ def run(args) -> dict:
                                                    {"sequence": full_sequences[0]})
         assert len(full_rules["scores"]) == 1
         summary["gui"] = gui_startup(executable, output, env)
-        summary.update(success=True, model_path=model["path"], folders=3, frames_per_folder=12,
+        summary.update(success=True, model_path=model["path"], folders=3, frames_per_folder=FRAMES,
+                       class_count=len(CLASSES), class_definitions_roundtrip=True,
                        dtype="uint16", full_resolution_shape=[2048, 3072], weights_sha256=WEIGHT_SHA256,
                        training_device="cpu", inference_device="auto", cold_inference=True)
     except Exception as error:

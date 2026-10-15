@@ -8,9 +8,20 @@ from PySide6.QtCore import Qt, Signal, QObject, QRunnable, QThreadPool, QPointF,
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGraphicsView, QGraphicsScene, QSlider, QSpinBox, QSplitter, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox, QLineEdit)
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox, QLineEdit, QScrollArea)
 
-COLORS = ['#4ed5c1', '#79a9ff', '#ffcc77', '#d29dff', '#ff8f9c', '#a7dc80']
+from .classdefs import CLASS_COLORS, DEFAULT_CLASS_DEFINITIONS
+
+COLORS = CLASS_COLORS
+
+
+def _definition_map(classes, definitions=None):
+    """Keep stable keys separate from editable presentation, including old callers."""
+    known = {item['id']: dict(item) for item in DEFAULT_CLASS_DEFINITIONS}
+    known.update({item['id']: dict(item) for item in (definitions or [])})
+    return {key: known.get(key, {'id': key, 'name': key, 'description': '',
+                                'color': COLORS[index % len(COLORS)]})
+            for index, key in enumerate(classes)}
 
 
 class _PreviewSignals(QObject):
@@ -174,6 +185,8 @@ class SequenceTimeline(QWidget):
         self.cache = cache
         self.cache.loaded.connect(self._loaded)
         self.images, self.classes, self.landmarks, self.scores = [], [], {}, []
+        self.class_definitions = {}
+        self.selected_class = None
         self.thumbs, self.thumb_keys = {}, {}
         self.cursor = 0
         self.drag_class = None
@@ -183,9 +196,11 @@ class SequenceTimeline(QWidget):
         self.setMouseTracking(True)
         self.setToolTip('썸네일을 클릭해 이동 · 아래 그래프를 클릭해 이미지 선택 · 색상 기준점을 드래그해 변경')
 
-    def set_sequence(self, sequence, classes, landmarks):
+    def set_sequence(self, sequence, classes, landmarks, class_definitions=None):
         self.images = sequence.get('images', []) if sequence else []
         self.classes, self.landmarks = list(classes), dict(landmarks)
+        self.class_definitions = _definition_map(classes, class_definitions)
+        self.selected_class = self.classes[0] if self.classes else None
         self.scores = []
         self.keep_range = None
         self.thumbs, self.thumb_keys = {}, {}
@@ -220,6 +235,20 @@ class SequenceTimeline(QWidget):
 
     def _index(self, x):
         return max(0, min(len(self.images)-1, round((x-15) / max(1,self.width()-30) * max(1,len(self.images)-1))))
+
+    def class_name(self, key):
+        return self.class_definitions.get(key, {}).get('name', key)
+
+    def class_color(self, key):
+        index = self.classes.index(key) if key in self.classes else 0
+        return self.class_definitions.get(key, {}).get('color', COLORS[index % len(COLORS)])
+
+    def _nearby_landmarks(self, x):
+        return sorted((key for key in self.classes
+                       if isinstance(self.landmarks.get(key), int)
+                       and abs(self._x(self.landmarks[key])-x) < 8),
+                      key=lambda key: (key != self.selected_class,
+                                       abs(self._x(self.landmarks[key])-x)))
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -256,19 +285,25 @@ class SequenceTimeline(QWidget):
             p.setPen(QPen(QColor('#7187a4'),1.5))
             for idx in range(1,min(len(self.images),len(self.scores))):
                 p.drawLine(QPointF(self._x(idx-1),graph_bottom-self.scores[idx-1]/maximum*(graph_bottom-graph_top)), QPointF(self._x(idx),graph_bottom-self.scores[idx]/maximum*(graph_bottom-graph_top)))
-        for idx, name in enumerate(self.classes):
+        # Paint the selected marker last so dense class sequences remain editable.
+        for name in sorted(self.classes, key=lambda key: key == self.selected_class):
             value = self.landmarks.get(name)
             if value is None:
                 continue
             x = self._x(value)
-            p.setPen(QPen(QColor(COLORS[idx%len(COLORS)]),2))
+            selected = name == self.selected_class
+            p.setPen(QPen(QColor(self.class_color(name)),3 if selected else 2))
             p.drawLine(QPointF(x,90),QPointF(x,graph_bottom+4))
-            p.setBrush(QColor(COLORS[idx%len(COLORS)]))
-            p.drawEllipse(QPointF(x,94),4,4)
+            p.setBrush(QColor(self.class_color(name)))
+            p.drawEllipse(QPointF(x,94),6 if selected else 4,6 if selected else 4)
         p.setPen(QPen(QColor('#ffffff'),1,Qt.PenStyle.DashLine))
         p.drawLine(QPointF(self._x(self.cursor),88),QPointF(self._x(self.cursor),graph_bottom+6))
         p.setPen(QColor('#8493a8'))
-        p.drawText(15,self.height()-3,'변화량 · 색상 기준점은 드래그해서 수정')
+        footer = '변화량 · 기준점에 마우스를 올리면 클래스 표시 · 드래그해서 수정'
+        if self.selected_class in self.classes:
+            number = self.classes.index(self.selected_class)+1
+            footer = f'{number}. {self.class_name(self.selected_class)} · 선택한 기준점 · 드래그해서 수정'
+        p.drawText(15,self.height()-3,p.fontMetrics().elidedText(footer, Qt.TextElideMode.ElideRight, self.width()-30))
 
     def mousePressEvent(self,event):
         if not self.images:
@@ -279,12 +314,23 @@ class SequenceTimeline(QWidget):
                 slot=min(len(indices)-1,int(event.position().x()/max(1,self.width())*len(indices)))
                 self.selected.emit(indices[slot])
             return
-        self.drag_class = next((name for name,value in self.landmarks.items() if abs(self._x(value)-event.position().x()) < 8),None)
+        nearby = self._nearby_landmarks(event.position().x())
+        self.drag_class = nearby[0] if nearby else None
         self.selected.emit(self._index(event.position().x()))
 
     def mouseMoveEvent(self,event):
         if event.buttons() & Qt.MouseButton.LeftButton and self.images and event.position().y()>=86:
             self.selected.emit(self._index(event.position().x()))
+        nearby = self._nearby_landmarks(event.position().x()) if event.position().y() >= 86 else []
+        if nearby:
+            lines = []
+            for key in nearby:
+                value = self.landmarks[key]
+                filename = self.images[value]['name'] if 0 <= value < len(self.images) else str(value+1)
+                lines.append(f'{self.classes.index(key)+1}. {self.class_name(key)} · {filename}')
+            self.setToolTip('\n'.join(lines))
+        else:
+            self.setToolTip('썸네일을 클릭해 이동 · 아래 그래프를 클릭해 이미지 선택 · 색상 기준점을 드래그해 변경')
 
     def mouseReleaseEvent(self,event):
         if self.drag_class is not None:
@@ -306,10 +352,12 @@ class SequenceEditor(QWidget):
         super().__init__(parent)
         self.sequence=None
         self.classes=[]
+        self.class_definitions={}
         self.landmarks={}
         self.cursor=0
         self.undo_stack=[]
         self.active_keys={}
+        self.analysis=None
         self.cache=PreviewCache(self)
         self.cache.loaded.connect(self._preview_loaded)
         main=QVBoxLayout(self)
@@ -391,16 +439,24 @@ class SequenceEditor(QWidget):
         split.addWidget(canvas)
         side=QWidget()
         side.setMinimumWidth(230)
-        side.setMaximumWidth(320)
+        side.setMaximumWidth(360)
         sl=QVBoxLayout(side)
         sl.setContentsMargins(12,0,0,0)
         label=QLabel('시작 기준점')
         label.setObjectName('sectionTitle')
         sl.addWidget(label)
-        hint=QLabel('상태가 처음 시작되는 이미지에 지정합니다.\n숫자 1–9 또는 아래 버튼으로 지정하세요.')
+        hint=QLabel('클래스가 처음 시작되는 이미지에 지정합니다.\n↑ ↓: 클래스 선택 · Space: 지정 · 1–9: 바로 지정')
         hint.setWordWrap(True)
         hint.setObjectName('muted')
         sl.addWidget(hint)
+        self.class_filter=QLineEdit()
+        self.class_filter.setPlaceholderText('클래스 이름 / 기준 검색')
+        self.class_filter.setClearButtonEnabled(True)
+        self.class_filter.textChanged.connect(self._filter_classes)
+        sl.addWidget(self.class_filter)
+        self.class_progress=QLabel('0 / 0개 지정')
+        self.class_progress.setObjectName('muted')
+        sl.addWidget(self.class_progress)
         self.label_table=QTableWidget(0,2)
         self.label_table.setHorizontalHeaderLabels(['클래스','이미지'])
         self.label_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
@@ -410,9 +466,21 @@ class SequenceEditor(QWidget):
         self.label_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.label_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.label_table.cellDoubleClicked.connect(self._jump_landmark)
+        self.label_table.currentCellChanged.connect(self._selected_class_changed)
         self.label_table.setMinimumHeight(120)
-        self.label_table.setMaximumHeight(220)
-        sl.addWidget(self.label_table)
+        self.label_table.setMaximumHeight(300)
+        sl.addWidget(self.label_table,1)
+        self.class_criterion=QLabel('클래스를 선택하면 라벨링 기준이 표시됩니다.')
+        self.class_criterion.setWordWrap(True)
+        self.class_criterion.setObjectName('muted')
+        criterion_scroll=QScrollArea()
+        criterion_scroll.setWidgetResizable(True)
+        criterion_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        criterion_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        criterion_scroll.setMinimumHeight(55)
+        criterion_scroll.setMaximumHeight(95)
+        criterion_scroll.setWidget(self.class_criterion)
+        sl.addWidget(criterion_scroll)
         assign=QPushButton('선택한 클래스에 현재 이미지 지정')
         assign.setObjectName('primary')
         assign.clicked.connect(self.assign_selected)
@@ -460,11 +528,28 @@ class SequenceEditor(QWidget):
             if view is not source:
                 view.sync(transform,center)
 
-    def set_sequence(self,sequence,classes,landmarks=None,cursor=0):
+    def set_sequence(self,sequence,classes,landmarks=None,cursor=0,class_definitions=None):
+        definitions = _definition_map(classes, class_definitions)
+        # Renaming/recoloring a class must not discard review offsets, rules or undo.
+        if (sequence == self.sequence and list(classes) == self.classes
+                and dict(landmarks or {}) == self.landmarks
+                and definitions != self.class_definitions):
+            self.class_definitions=definitions
+            self.timeline.class_definitions=definitions
+            self._update_labels()
+            self._update_warning()
+            if self.analysis is not None:
+                candidate_index=self.candidates.currentIndex()
+                self.set_analysis(self.analysis)
+                self.candidates.setCurrentIndex(candidate_index)
+            self.timeline.update()
+            return
         self.sequence=sequence
         self.classes=list(classes)
+        self.class_definitions=definitions
         self.landmarks=dict(landmarks or {})
         self.undo_stack=[]
+        self.analysis=None
         images=sequence.get('images',[]) if sequence else []
         self.folder_label.setText(sequence.get('relative_path','') if sequence else '이미지 폴더를 선택하세요')
         self.folder_label.setToolTip(sequence.get('path','') if sequence else '')
@@ -474,7 +559,7 @@ class SequenceEditor(QWidget):
         self.jump.blockSignals(True)
         self.jump.setRange(1,max(1,len(images)))
         self.jump.blockSignals(False)
-        self.timeline.set_sequence(sequence,classes,self.landmarks)
+        self.timeline.set_sequence(sequence,classes,self.landmarks,class_definitions=list(definitions.values()))
         self._update_labels()
         self._training_keep_range()
         self.candidates.clear()
@@ -573,20 +658,40 @@ class SequenceEditor(QWidget):
         self._labels_changed()
 
     def assign_selected(self):
-        row=self.label_table.currentRow()
-        if 0<=row<len(self.classes):
-            self.assign(self.classes[row])
+        key=self._class_at_row(self.label_table.currentRow())
+        if key is not None:
+            self.assign(key)
+
+    def select_next_class(self,delta):
+        """Move through visible classes, including those beyond numeric shortcuts."""
+        rows=[row for row in range(self.label_table.rowCount()) if not self.label_table.isRowHidden(row)]
+        if not rows:
+            return
+        current=self.label_table.currentRow()
+        position=rows.index(current) if current in rows else (-1 if delta > 0 else 0)
+        self.label_table.selectRow(rows[(position+delta) % len(rows)])
+        self.label_table.scrollToItem(self.label_table.currentItem())
+
+    def _class_at_row(self,row):
+        item=self.label_table.item(row,0) if row >= 0 else None
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+    def _class_name(self,key):
+        return self.class_definitions.get(key,{}).get('name',key)
 
     def assign_number(self,number):
         if 0<=number<len(self.classes):
+            if self.label_table.isRowHidden(number):
+                self.class_filter.clear()
             self.label_table.selectRow(number)
+            self.label_table.scrollToItem(self.label_table.currentItem())
             self.assign(self.classes[number])
 
     def remove_selected(self):
-        row=self.label_table.currentRow()
-        if 0<=row<len(self.classes) and self.classes[row] in self.landmarks:
+        key=self._class_at_row(self.label_table.currentRow())
+        if key in self.landmarks:
             self.undo_stack.append(dict(self.landmarks))
-            self.landmarks.pop(self.classes[row])
+            self.landmarks.pop(key)
             self._labels_changed()
 
     def undo(self):
@@ -603,22 +708,64 @@ class SequenceEditor(QWidget):
         self.changed.emit(dict(self.landmarks))
 
     def _update_labels(self):
-        row=self.label_table.currentRow()
+        selected=self._class_at_row(self.label_table.currentRow())
+        self.label_table.blockSignals(True)
         self.label_table.setRowCount(len(self.classes))
         images=self.sequence.get('images',[]) if self.sequence else []
-        for idx,name in enumerate(self.classes):
-            title=QTableWidgetItem(f'{idx+1}. {name}')
-            title.setForeground(QColor(COLORS[idx%len(COLORS)]))
+        for idx,key in enumerate(self.classes):
+            definition=self.class_definitions[key]
+            title=QTableWidgetItem(f'{idx+1}. {definition["name"]}')
+            title.setData(Qt.ItemDataRole.UserRole,key)
+            title.setToolTip(definition['name']+'\n'+definition.get('description',''))
+            title.setForeground(QColor(definition.get('color',COLORS[idx%len(COLORS)])))
             self.label_table.setItem(idx,0,title)
-            value=self.landmarks.get(name)
+            value=self.landmarks.get(key)
             text=images[value]['name'] if isinstance(value,int) and 0<=value<len(images) else '미지정'
             self.label_table.setItem(idx,1,QTableWidgetItem(text))
         if self.classes:
-            self.label_table.selectRow(max(0,min(row,len(self.classes)-1)))
+            self.label_table.selectRow(self.classes.index(selected) if selected in self.classes else 0)
+        self.label_table.blockSignals(False)
+        self._filter_classes()
+
+    def _filter_classes(self,*args):
+        query=self.class_filter.text().strip().casefold()
+        visible=[]
+        for row,key in enumerate(self.classes):
+            definition=self.class_definitions[key]
+            haystack=f'{row+1} {definition["name"]} {definition.get("description","")}'.casefold()
+            hide=bool(query and query not in haystack)
+            self.label_table.setRowHidden(row,hide)
+            if not hide:
+                visible.append(row)
+        if self.label_table.currentRow() not in visible:
+            if visible:
+                self.label_table.selectRow(visible[0])
+            else:
+                self.label_table.clearSelection()
+                self.label_table.setCurrentCell(-1,-1)
+        images=self.sequence.get('images',[]) if self.sequence else []
+        count=sum(isinstance(self.landmarks.get(key),int) and 0<=self.landmarks[key]<len(images)
+                  for key in self.classes)
+        suffix=f' · 검색 {len(visible)}개' if query else ''
+        self.class_progress.setText(f'{count} / {len(self.classes)}개 지정{suffix}')
+        self._selected_class_changed()
+
+    def _selected_class_changed(self,*args):
+        key=self._class_at_row(self.label_table.currentRow())
+        self.timeline.selected_class=key
+        self.timeline.update()
+        if key is None:
+            self.class_criterion.setText('클래스를 선택하면 라벨링 기준이 표시됩니다.')
+            return
+        description=self.class_definitions[key].get('description','').strip()
+        self.class_criterion.setText(f'{self.classes.index(key)+1}. {self._class_name(key)}\n'
+                                     +(description or '이 클래스가 처음 시작되는 이미지를 지정하세요.'))
+        self.class_criterion.setToolTip(description)
 
     def _jump_landmark(self,row,column):
-        if 0<=row<len(self.classes) and self.classes[row] in self.landmarks:
-            self.set_cursor(self.landmarks[self.classes[row]])
+        key=self._class_at_row(row)
+        if key in self.landmarks:
+            self.set_cursor(self.landmarks[key])
 
     def validation_errors(self):
         errors=[]
@@ -628,7 +775,7 @@ class SequenceEditor(QWidget):
         for name in self.classes:
             value=self.landmarks.get(name)
             if not isinstance(value,int) or not 0<=value<len(self.sequence['images']):
-                errors.append(f'{name}: 기준점을 지정하세요.')
+                errors.append(f'{self._class_name(name)}: 기준점을 지정하세요.')
             else:
                 values.append(value)
         if any(a>=b for a,b in zip(values,values[1:])):
@@ -636,9 +783,15 @@ class SequenceEditor(QWidget):
         return errors
 
     def _update_warning(self):
-        self.warning.setText('\n'.join(self.validation_errors()))
+        errors=self.validation_errors()
+        visible=errors[:3]
+        if len(errors)>3:
+            visible.append(f'외 {len(errors)-3}개 · 클래스 목록을 확인하세요.')
+        self.warning.setText('\n'.join(visible))
+        self.warning.setToolTip('\n'.join(errors))
 
     def set_analysis(self,analysis):
+        self.analysis=analysis
         self.timeline.set_scores(analysis.get('scores',analysis.get('rule_analysis',{}).get('scores',[])))
         self.candidates.clear()
         candidates=analysis.get('candidates',[])
@@ -655,7 +808,7 @@ class SequenceEditor(QWidget):
             else:
                 idx,name=candidate,'변화 후보'
             if isinstance(idx,int) and self.sequence and 0<=idx<len(self.sequence['images']):
-                self.candidates.addItem(f'{name} · {self.sequence["images"][idx]["name"]}',idx)
+                self.candidates.addItem(f'{self._class_name(name)} · {self.sequence["images"][idx]["name"]}',idx)
         if not self.candidates.count():
             self.candidates.addItem('추천 후보 없음',None)
         warnings=analysis.get('warnings',[])

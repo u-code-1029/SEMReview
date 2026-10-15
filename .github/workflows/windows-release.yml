@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Unique release tag (for example windows-v0.1.0)
+        description: Unique release tag (for example windows-v0.2.0)
         required: true
-        default: windows-v0.1.0
+        default: windows-v0.2.0
         type: string
       publish:
         description: Publish a GitHub Release after both builds pass
@@ -37,7 +37,7 @@ jobs:
           tag = os.environ['RELEASE_TAG']
           match = re.fullmatch(r'(?:windows-)?v([0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?)', tag)
           if not match:
-              raise SystemExit('Use a tag such as windows-v0.1.0 or v0.1.0-rc.1')
+              raise SystemExit('Use a tag such as windows-v0.2.0 or v0.2.0-rc.1')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write(f'version={match.group(1)}\n')
           PY
@@ -159,17 +159,29 @@ jobs:
       - name: Prepare release notes
         run: |
           cat > release-notes.md <<'NOTES'
-          Windows x64 portable builds. Download the variant you need, extract the entire archive, then open `SEMReview/SEMReview.exe`.
+          Windows x64용 SEM Review입니다. Python 설치 없이 압축을 풀어 실행할 수 있습니다. 공개 저장소이므로 GitHub 로그인 없이 다운로드할 수 있습니다.
 
-          - **CPU**: works without NVIDIA hardware.
-          - **NVIDIA cu126**: CUDA 12.6 runtime for supported GTX and RTX 20/30/40-series GPUs. Use a compatible NVIDIA driver. RTX 50-series is not supported by this CUDA build; use the CPU variant.
-          - If a variant is split into `.zip.001`, `.zip.002`, ... download **all** its parts plus its `manifest.json`, `Extract-*.cmd`, and `Extract-*.ps1` into one folder. Double-click its `Extract-*.cmd`; it verifies checksums, joins, and extracts the ZIP. No third-party archiver is needed.
-          - Each variant includes a SHA256 checksum list and build information. These are unsigned builds.
-          - Python and the required runtime libraries are bundled. In training settings, enable the first download of official ResNet18 weights, or select a previously downloaded weights file.
+          ### 0.2 변경 사항
 
-          Both variants pass Windows tests and packaged CPU training/inference checks before publication. The CI machine has no NVIDIA GPU: GPU behavior, 8 GB VRAM usage, and actual SEM accuracy still require testing on your data and hardware.
+          - **클래스 정의** 화면에서 2~64개 클래스의 이름·판별 기준·색상·등장 순서를 편집합니다. 여러 이름 추가, 순서 이동, JSON 가져오기/내보내기를 지원합니다.
+          - 이름과 고유 ID를 분리하여 이름을 바꿔도 기존 라벨이 유지됩니다. 기준 수정이나 클래스 추가·삭제·순서 변경은 완료 폴더를 다시 확인하도록 합니다.
+          - 긴 클래스 목록을 검색하고, ↑/↓로 클래스 선택 후 Space로 지정할 수 있습니다. 1~9 바로 지정 단축키도 유지됩니다.
+          - 모델마다 학습 당시 클래스 정의를 저장합니다. 이전 프로젝트는 DB 백업 후 자동 변환하며, 이전 모델도 불러올 수 있습니다. 변환된 프로젝트는 0.2 이상으로 열어 주세요.
+          - 첫 클래스부터 선택한 끝점까지 모든 중간 이미지를 연속 보존합니다. 클래스는 폴더마다 지정한 순서로 한 번씩 나타나는 기준점입니다.
 
-          No private images, project databases, or trained models are included. For a private repository, downloads require an authorized GitHub login.
+          ### 받을 파일과 실행
+
+          - **NVIDIA 학습 PC: nvidia-cu126** — 지원되는 GTX 및 RTX 20·30·40 계열용 CUDA 12.6 런타임 포함. GPU에 맞는 NVIDIA 드라이버가 필요하며 별도 CUDA Toolkit은 필요하지 않습니다. RTX 50 계열의 GPU 실행은 이 빌드에서 지원하지 않습니다.
+          - **GPU가 없는 PC: cpu** — CPU에서 라벨링·학습·검수를 실행합니다.
+          - ZIP 전체를 압축 해제하고 `SEMReview/SEMReview.exe`를 실행하세요. 옆의 `_internal` 폴더도 필요합니다.
+          - `.zip.001`, `.zip.002`로 분할된 버전은 **모든 조각**, 해당 `manifest.json`, `Extract-*.cmd`, `Extract-*.ps1`을 같은 폴더에 받고 `Extract-*.cmd`를 실행하세요. 체크섬 검증 후 ZIP을 합치고 압축을 풀어줍니다.
+          - 최초 학습 시 공식 ResNet18 가중치 다운로드를 허용하거나 이미 받은 가중치를 지정합니다. 저장된 모델로 검수할 때는 다시 다운로드하지 않습니다.
+
+          ### 검증 범위
+
+          두 Windows 패키지는 자동 테스트, 실행 파일에서 12개 사용자 클래스의 합성 학습·모델 저장·추론, 3072×2048 16비트 TIFF 분석과 GUI 시작을 통과한 뒤 게시됩니다. CI에는 NVIDIA GPU가 없어 실제 GPU 실행, 8GB VRAM 사용량과 실제 SEM 정확도는 해당 데이터/장비에서 확인해야 합니다.
+
+          패키지별 SHA256 체크섬과 라이브러리 버전 정보를 제공합니다. 실행 파일은 코드 서명되지 않은 초기 배포판입니다. 사용자 이미지·프로젝트 DB·학습 모델은 배포 파일에 포함하지 않았습니다.
           NOTES
       - name: Publish validated assets
         env:

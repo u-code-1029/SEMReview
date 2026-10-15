@@ -6,6 +6,8 @@ import argparse
 import multiprocessing
 import sys
 
+from . import __version__
+
 
 def main() -> int:
     multiprocessing.freeze_support()
@@ -14,7 +16,7 @@ def main() -> int:
     parser.add_argument("--worker", metavar="COMMAND", help=argparse.SUPPRESS)
     parser.add_argument("--request", help=argparse.SUPPRESS)
     parser.add_argument("--cancel-file", help=argparse.SUPPRESS)
-    parser.add_argument("--version", action="version", version="SEM Review 0.1.0")
+    parser.add_argument("--version", action="version", version=f"SEM Review {__version__}")
     args = parser.parse_args()
     if args.worker:
         from .worker import run_worker
@@ -27,7 +29,7 @@ def main() -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("SEM Review")
     app.setOrganizationName("SEMReview")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     window = MainWindow(args.project)
     window.show()

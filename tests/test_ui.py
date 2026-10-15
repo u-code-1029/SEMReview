@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QMessageBox
 from semreview.core import scan
 from semreview.project import DEFAULT_CLASSES, DEFAULT_PROFILES, Project, sequence_signature
 from semreview.ui import MainWindow, SettingsDialog
+from semreview.class_editor import ClassDefinitionsDialog
 
 
 @pytest.fixture
@@ -32,6 +33,7 @@ def window(qtbot, tmp_path, monkeypatch):
                                     sequence_signature(seq), "complete", 2)
         # UI model-selection fixture, never submitted to the ML loader.
         project.add_model({"id": "fixture-model", "name": "검증용 모델", "classes": DEFAULT_CLASSES,
+                           "class_definitions": project.class_definitions(),
                            "path": str(project_dir / "fixture.sem-model"), "metrics": {"validated": False}})
     widget = MainWindow(str(project_dir))
     qtbot.addWidget(widget)
@@ -87,6 +89,7 @@ def test_training_payload_contains_only_checked_completed_folders(window, monkey
     assert len(payload["sequences"]) == 2
     assert payload["config"]["group_level"] == 2
     assert payload["config"]["allow_download"] is False
+    assert payload["class_definitions"] == window.project.class_definitions()
 
 
 def test_review_edit_is_independent_and_preserves_other_approvals(window):
@@ -137,15 +140,77 @@ def test_ui_real_apply_and_restore_worker_roundtrip(window, qtbot):
     assert all(Path(path).read_bytes() == data for path, data in originals.items())
 
 
-def test_settings_support_arbitrary_depth_and_classes(window, qtbot):
+def test_settings_support_arbitrary_depth(window, qtbot):
     dialog = SettingsDialog(window.project)
     qtbot.addWidget(dialog)
     dialog._add_level()
     dialog._add_level()
-    dialog.class_names.setText("바닥, 1층, 2층, 3층, 4층")
     dialog.accept()
     assert len(dialog.profiles[0]["levels"]) == 4
-    assert dialog.classes == ["바닥", "1층", "2층", "3층", "4층"]
+    assert not hasattr(dialog, "class_names")
+
+
+def test_editing_class_name_keeps_labels_and_saved_model_snapshot(window, monkeypatch):
+    original = window.project.class_definitions()
+    changed = [dict(item) for item in original]
+    changed[0].update(name="기판 노출")
+    before = window.project.annotations()
+
+    def save_dialog(dialog):
+        dialog.definitions = changed
+        return ClassDefinitionsDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ClassDefinitionsDialog, "exec", save_dialog)
+    window.edit_class_definitions()
+    assert window.project.class_definitions() == changed
+    assert window.project.annotations() == before
+    assert "기판 노출" in window.classes_summary.text()
+    assert window.editor.landmarks == before[window.current_sequence["relative_path"]]["landmarks"]
+    assert window.review_model.currentData()["class_definitions"] == original
+    assert window.end_class.itemText(0) == original[0]["name"]
+    assert window.end_class.itemData(0) == DEFAULT_CLASSES[0]
+
+
+def test_review_end_class_uses_id_not_display_name(window):
+    populate_review(window)
+    window.end_class.setCurrentIndex(1)
+    assert window.end_class.currentText() != window.end_class.currentData()
+    assert window.project.get("review_end_class") == DEFAULT_CLASSES[1]
+    assert window.plans[0]["end"] == 7
+    window._review_model_changed()
+    assert window.end_class.currentData() == DEFAULT_CLASSES[1]
+
+
+def test_missing_boundary_error_displays_model_class_name(window, monkeypatch):
+    populate_review(window)
+    missing_id = DEFAULT_CLASSES[1]
+    missing_name = window.review_model.currentData()["class_definitions"][1]["name"]
+    del window.predictions[0]["landmarks"][missing_id]
+    window._rebuild_plans()
+    expected = f"클래스 기준점이 없거나 범위를 벗어났습니다: {missing_name}"
+    assert expected in window.plans[0]["errors"]
+    assert expected in window.review_table.item(0, 5).text()
+    captured = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, message: captured.append(message))
+    window.review_table.setCurrentCell(0, 0)
+    window.approve_current_review()
+    assert expected in captured[0]
+    assert f": {missing_id}" not in captured[0]
+
+
+def test_class_addition_refreshes_labeling_and_invalidates_completion(window, monkeypatch):
+    from semreview.classdefs import new_definition
+    changed = window.project.class_definitions() + [new_definition("상부 연결")]
+
+    def save_dialog(dialog):
+        dialog.definitions = changed
+        return ClassDefinitionsDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ClassDefinitionsDialog, "exec", save_dialog)
+    window.edit_class_definitions()
+    assert len(window.editor.classes) == 4
+    assert all(item["status"] == "draft" for item in window.project.annotations().values())
+    assert "4개" in window.classes_summary.text()
 
 
 def test_input_fields_do_not_trigger_label_shortcuts(window, qtbot):
@@ -154,3 +219,38 @@ def test_input_fields_do_not_trigger_label_shortcuts(window, qtbot):
     before = dict(window.editor.landmarks)
     qtbot.keyClicks(window.model_name, "123")
     assert window.editor.landmarks == before
+
+
+def test_class_shortcuts_preserve_folder_and_review_table_navigation(window, qtbot):
+    window.activateWindow()
+    window.folder_list.setCurrentRow(0)
+    window.folder_list.setFocus()
+    qtbot.keyClick(window.folder_list, Qt.Key.Key_Down)
+    assert window.folder_list.currentRow() == 1
+    populate_review(window)
+    window.review_table.setCurrentCell(0, 1)
+    window.review_table.setFocus()
+    before = dict(window.review_editor.landmarks)
+    qtbot.keyClick(window.review_table, Qt.Key.Key_Space)
+    assert window.review_table.item(0, 1).checkState() == Qt.CheckState.Checked
+    assert window.review_editor.landmarks == before
+    qtbot.keyClick(window.review_table, Qt.Key.Key_Down)
+    assert window.review_table.currentRow() == 1
+
+
+def test_keyboard_can_select_and_assign_twelfth_class(window, qtbot):
+    from semreview.classdefs import new_definition
+    definitions = [new_definition(f"패턴 {i+1}", index=i) for i in range(12)]
+    window.project.update_class_definitions(definitions)
+    window.annotations = window.project.annotations()
+    window._load_training_sequence(window.current_sequence)
+    window.activateWindow()
+    window.editor.label_table.setCurrentCell(10, 0)
+    window.editor.label_table.setFocus()
+    window.editor.set_cursor(11)
+    qtbot.keyClick(window.editor.label_table, Qt.Key.Key_Down)
+    assert window.editor.label_table.currentRow() == 11
+    qtbot.keyClick(window.editor.label_table, Qt.Key.Key_Space)
+    assert window.editor.landmarks[definitions[11]["id"]] == 11
+    saved = window.project.annotations()[window.current_sequence["relative_path"]]
+    assert saved["landmarks"][definitions[11]["id"]] == 11

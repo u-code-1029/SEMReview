@@ -9,6 +9,8 @@ import tifffile
 from safetensors.numpy import save as save_tensors
 
 from semreview import ml
+from semreview.classdefs import (DEFAULT_CLASSES, DEFAULT_CLASS_DEFINITIONS, class_ids,
+                                legacy_definitions, new_definition, normalize_model_metadata)
 
 
 def test_ordered_decode_matches_brute_force():
@@ -42,7 +44,7 @@ def _package(tmp_path, *, extra=None, identifier="safe-model", corrupt=False, me
     tensors = {"head.weight": np.zeros((13, 3), np.float32), "head.mean": np.zeros(13, np.float32),
                "head.std": np.ones(13, np.float32), "encoder.fake": np.ones(1, np.float32)}
     payload = save_tensors(tensors)
-    metadata = {"format_version": ml.FORMAT_VERSION, "architecture": "resnet18-frozen", "id": identifier,
+    metadata = {"format_version": 1, "architecture": "resnet18-frozen", "id": identifier,
                 "preprocess_version": ml.PREPROCESS_VERSION, "classes": ["바닥", "천장1", "천장2"],
                 "metrics": {"validated": False}, "weights_sha256": hashlib.sha256(payload).hexdigest()}
     metadata.update(metadata_overrides or {})
@@ -59,7 +61,8 @@ def test_model_package_safe_roundtrip_and_import(tmp_path, monkeypatch):
     monkeypatch.setattr(ml, "_validate_architecture", lambda *args: None)
     path = _package(tmp_path)
     info = ml.inspect_model(path)
-    assert info["classes"] == ["바닥", "천장1", "천장2"]
+    assert info["classes"] == class_ids(legacy_definitions(["바닥", "천장1", "천장2"]))
+    assert [item["name"] for item in info["class_definitions"]] == ["바닥", "천장1", "천장2"]
     imported = ml.import_model(path, tmp_path / "project")
     assert imported["id"] == info["id"]
     assert imported["path"] != str(path)
@@ -100,7 +103,7 @@ def test_valid_optional_display_metadata_roundtrip(tmp_path, monkeypatch):
                             "folders_needing_correction": .5, "reason": "", "end_class": "천장2"}}
     result = ml.inspect_model(_package(tmp_path, metadata_overrides=metadata))
     assert result["name"] == metadata["name"]
-    assert result["metrics"] == metadata["metrics"]
+    assert result["metrics"] == normalize_model_metadata({**metadata, "classes": ["바닥", "천장1", "천장2"]})["metrics"]
 
 
 class FakeEncoder:
@@ -138,7 +141,7 @@ def test_train_infer_portable_package_and_fold_metrics(tmp_path, monkeypatch):
     result = ml.train(str(tmp_path / "project"), sequences, annotations, ["바닥", "천장1", "천장2"], "테스트", {"epochs": 8})
     assert result["metrics"]["validated"]
     assert result["metrics"]["folds"] == 3
-    assert set(result["metrics"]["by_class"]) == {"바닥", "천장1", "천장2"}
+    assert set(result["metrics"]["by_class"]) == set(class_ids(legacy_definitions(["바닥", "천장1", "천장2"])))
     predictions = ml.infer(result["path"], sequences, str(tmp_path / "other-project"))
     assert len(predictions) == 3
     for prediction in predictions:
@@ -224,3 +227,62 @@ def test_real_resnet_forward_and_scalar_serialization(tmp_path, monkeypatch):
     assert ml.inspect_model(result["path"])["id"] == result["id"]
     _, loaded = ml._read_package(result["path"])
     assert loaded["encoder.bn1.num_batches_tracked"].shape == ()
+
+
+def test_v2_package_roundtrip_and_reject_mismatched_definitions(tmp_path, monkeypatch):
+    monkeypatch.setattr(ml, "_validate_architecture", lambda *args: None)
+    metadata = {"format_version": 2, "classes": DEFAULT_CLASSES, "class_definitions": DEFAULT_CLASS_DEFINITIONS}
+    loaded = ml.inspect_model(_package(tmp_path, metadata_overrides=metadata))
+    assert loaded["classes"] == DEFAULT_CLASSES
+    assert loaded["class_definitions"] == DEFAULT_CLASS_DEFINITIONS
+    for malformed in [{"class_definitions": []}, {"classes": list(reversed(DEFAULT_CLASSES))},
+                      {"class_definitions": None}]:
+        with pytest.raises(ValueError):
+            ml.inspect_model(_package(tmp_path, metadata_overrides={**metadata, **malformed}))
+    with pytest.raises(ValueError, match="정의가 없습니다"):
+        ml.inspect_model(_package(tmp_path, metadata_overrides={"format_version": 2}))
+
+
+def test_legacy_model_long_class_names_are_preserved_without_truncation(tmp_path, monkeypatch):
+    monkeypatch.setattr(ml, "_validate_architecture", lambda *args: None)
+    names = ["처음 나타나는 복잡한 패턴의 경계 " * 30, "중간 " * 50, "마지막 " * 50]
+    names = [name.rstrip() for name in names]
+    metadata = ml.inspect_model(_package(tmp_path, metadata_overrides={"classes": names}))
+    assert [item["name"] for item in metadata["class_definitions"]] == names
+    assert metadata["classes"] == class_ids(legacy_definitions(names))
+
+
+def test_train_validates_definition_order_before_loading_encoder(tmp_path, monkeypatch):
+    monkeypatch.setattr(ml, "_load_encoder", lambda *args, **kwargs: pytest.fail("Must validate before loading encoder"))
+    with pytest.raises(ValueError, match="순서"):
+        ml.train(str(tmp_path), [], {}, list(reversed(DEFAULT_CLASSES)), "bad",
+                 class_definitions=DEFAULT_CLASS_DEFINITIONS)
+
+
+def test_twelve_class_training_and_inference_preserve_ids_and_snapshot(tmp_path, monkeypatch):
+    definitions = [new_definition(f"전이 {i + 1}", i) for i in range(12)]
+    definitions[10]["description"] = "열한 번째 경계가 처음 나타나는 이미지"
+    ids = class_ids(definitions)
+    sequences = [{"relative_path": "group/sample", "images": [{} for _ in range(20)]}]
+    annotations = {"group/sample": dict(zip(ids, range(2, 14)))}
+    features = np.arange(20 * 7, dtype=np.float32).reshape(20, 7) / 100
+    rules = {"candidates": list(range(20)), "warnings": []}
+    monkeypatch.setattr(ml, "_sequence_features", lambda *args, **kwargs: (features, rules, "data-sig"))
+    monkeypatch.setattr(ml, "_load_encoder", lambda *args, **kwargs: FakeEncoder())
+    monkeypatch.setattr(ml, "_Encoder", FakeEncoder)
+    monkeypatch.setattr(ml, "_validate_architecture", lambda *args: None)
+    result = ml.train(str(tmp_path), sequences, annotations, ids, "12 클래스", {"epochs": 1},
+                      class_definitions=definitions)
+    assert result["format_version"] == 2
+    assert result["classes"] == ids
+    assert result["class_definitions"] == definitions
+    definitions[10]["name"] = "프로젝트에서 나중에 변경한 이름"
+    inspected, tensors = ml._read_package(result["path"])
+    assert inspected["class_definitions"][10]["name"] == "전이 11"
+    assert tensors["head.weight"].shape == (7, 12)
+    prediction = ml.infer(result["path"], sequences, str(tmp_path))[0]
+    assert list(prediction["landmarks"]) == ids
+    assert list(prediction["candidates"]) == ids
+    positions = list(prediction["landmarks"].values())
+    assert len(positions) == 12 and all(a < b for a, b in zip(positions, positions[1:]))
+    assert not any(identifier in warning for identifier in ids for warning in prediction["warnings"])

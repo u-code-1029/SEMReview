@@ -205,7 +205,7 @@ def make_review_plan(base: str, sequence: dict, landmarks: dict[str, int],
         else:
             positions.append(index)
     if len(positions) == len(classes) and any(a >= b for a, b in zip(positions, positions[1:])):
-        result["errors"].append("기준점은 바닥부터 천장까지 엄격한 오름차순이어야 합니다.")
+        result["errors"].append("기준점은 정의한 클래스 순서대로 엄격한 오름차순이어야 합니다.")
     try:
         folder = Path(sequence["path"])
         _safe_path(folder, root)
@@ -238,7 +238,7 @@ def make_review_plan(base: str, sequence: dict, landmarks: dict[str, int],
     end = min(raw_end, len(images) - 1)
     result.update(start=start, end=end, start_index=start, end_index=end)
     if end < start:
-        result["errors"].append("계산된 끝점이 바닥보다 앞에 있습니다.")
+        result["errors"].append("계산된 끝점이 시작 기준점보다 앞에 있습니다.")
         return result
     if raw_end >= len(images):
         result["warnings"].append(f"뒤쪽 이미지가 {raw_end - len(images) + 1}장 부족하여 마지막 이미지까지 보존합니다.")
