@@ -1,0 +1,190 @@
+name: Windows download release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Unique release tag (for example windows-v0.1.0)
+        required: true
+        default: windows-v0.1.0
+        type: string
+      publish:
+        description: Publish a GitHub Release after both builds pass
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python - <<'PY'
+          import os, re
+          tag = os.environ['RELEASE_TAG']
+          match = re.fullmatch(r'(?:windows-)?v([0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?)', tag)
+          if not match:
+              raise SystemExit('Use a tag such as windows-v0.1.0 or v0.1.0-rc.1')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write(f'version={match.group(1)}\n')
+          PY
+
+  build:
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            torch_index: cpu
+          - variant: nvidia-cu126
+            torch_index: cu126
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements-tested.txt
+            .github/workflows/windows-release.yml
+      - name: Install pinned CPU or CUDA runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/${{ matrix.torch_index }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "from pathlib import Path; lines=Path('requirements-tested.txt').read_text().splitlines(); Path('requirements-windows-build.txt').write_text('\n'.join(x for x in lines if not x.startswith(('torch==', 'torchvision=='))) + '\ntorch==2.13.0\ntorchvision==0.28.0\n')"
+          python -m pip install -r requirements-windows-build.txt -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+      - name: Record and verify build runtime
+        env:
+          BUILD_VARIANT: ${{ matrix.variant }}
+        run: |
+          @'
+          import importlib.metadata, json, os, platform, sys
+          from pathlib import Path
+          import torch, torchvision
+          expected = '12.6' if os.environ['BUILD_VARIANT'] == 'nvidia-cu126' else None
+          assert torch.version.cuda == expected, (torch.version.cuda, expected)
+          assert torch.__version__.split('+')[0] == '2.13.0'
+          assert torchvision.__version__.split('+')[0] == '0.28.0'
+          details = {
+              'python': sys.version, 'platform': platform.platform(),
+              'commit': os.environ['GITHUB_SHA'], 'cuda_runtime': torch.version.cuda,
+              'cuda_architectures': torch._C._cuda_getArchFlags() if torch.version.cuda else None,
+              'dependencies': {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
+              'validation': 'Windows CI CPU tests and packaged smoke; GPU hardware not available',
+          }
+          Path('artifacts').mkdir(exist_ok=True)
+          Path('artifacts/build-info.json').write_text(json.dumps(details, indent=2), encoding='utf-8')
+          print(json.dumps({k: v for k, v in details.items() if k != 'dependencies'}, indent=2))
+          '@ | python -
+      - name: Lint and test
+        run: |
+          python -m ruff check src tests scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build native Windows executable
+        run: python scripts/build.py
+      - name: Exercise the packaged executable
+        run: python scripts/smoke_packaged.py --executable dist/SEMReview/SEMReview.exe --output artifacts/windows-smoke
+      - name: Package release downloads and SHA256 checksums
+        run: >-
+          python scripts/package_windows.py
+          --variant ${{ matrix.variant }}
+          --version ${{ needs.prepare.outputs.version }}
+          --metadata artifacts/build-info.json
+          --output release
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.variant }}
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload diagnostics without training data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostics-${{ matrix.variant }}
+          path: |
+            artifacts/build-info.json
+            artifacts/windows-smoke/summary.json
+            artifacts/windows-smoke/*/events.jsonl
+            artifacts/windows-smoke/*/stdout.log
+            artifacts/windows-smoke/*/stderr.log
+            build/SEMReview/warn-SEMReview.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    if: inputs.publish
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: release
+          merge-multiple: true
+      - name: Prepare release notes
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Windows x64 portable builds. Download the variant you need, extract the entire archive, then open `SEMReview/SEMReview.exe`.
+
+          - **CPU**: works without NVIDIA hardware.
+          - **NVIDIA cu126**: CUDA 12.6 runtime for supported GTX and RTX 20/30/40-series GPUs. Use a compatible NVIDIA driver. RTX 50-series is not supported by this CUDA build; use the CPU variant.
+          - If a variant is split into `.zip.001`, `.zip.002`, ... download **all** its parts plus its `manifest.json`, `Extract-*.cmd`, and `Extract-*.ps1` into one folder. Double-click its `Extract-*.cmd`; it verifies checksums, joins, and extracts the ZIP. No third-party archiver is needed.
+          - Each variant includes a SHA256 checksum list and build information. These are unsigned builds.
+          - Python and the required runtime libraries are bundled. In training settings, enable the first download of official ResNet18 weights, or select a previously downloaded weights file.
+
+          Both variants pass Windows tests and packaged CPU training/inference checks before publication. The CI machine has no NVIDIA GPU: GPU behavior, 8 GB VRAM usage, and actual SEM accuracy still require testing on your data and hardware.
+
+          No private images, project databases, or trained models are included. For a private repository, downloads require an authorized GitHub login.
+          NOTES
+      - name: Publish validated assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # A rerun may resume this run's draft, but never replace a published release.
+          if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > existing-release.json 2>/dev/null; then
+            python - <<'PY'
+          import json, os
+          release = json.load(open('existing-release.json'))
+          if not release['isDraft'] or release['targetCommitish'] != os.environ['GITHUB_SHA']:
+              raise SystemExit('Tag already belongs to another release. Choose a new tag.')
+          PY
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "SEM Review $RELEASE_TAG" --notes-file release-notes.md --draft --prerelease
+          fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --notes-file release-notes.md
+          gh release view "$RELEASE_TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
