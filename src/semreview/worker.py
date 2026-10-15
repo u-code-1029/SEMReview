@@ -56,7 +56,13 @@ def run_worker(command: str, request_path: str, cancel_file: str | None) -> int:
             stream.write(line + "\n")
             stream.flush()
         if sys.stdout is not None:
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except (OSError, UnicodeError):
+                # Frozen Windows apps can inherit a restrictive code page or a
+                # closed pipe. Console diagnostics must not break the UTF-8
+                # file protocol after its event has already been persisted.
+                pass
 
     def cancelled() -> bool:
         return bool(cancel_file and Path(cancel_file).exists())
@@ -76,6 +82,9 @@ def run_worker(command: str, request_path: str, cancel_file: str | None) -> int:
         return 0
     except Exception as error:
         if sys.stderr is not None:
-            traceback.print_exc(file=sys.stderr)
+            try:
+                traceback.print_exc(file=sys.stderr)
+            except (OSError, UnicodeError):
+                pass
         emit({"type": "cancelled" if cancelled() else "error", "message": str(error)})
         return 2 if cancelled() else 1
