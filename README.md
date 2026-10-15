@@ -4,7 +4,7 @@ macOS / Windows용 로컬 SEM 이미지 라벨링·학습·검수 앱입니다. 
 
 ## Windows 다운로드
 
-배포 파일은 [GitHub Releases](https://github.com/u-code-1029/SEMReview/releases)에 게시합니다. 비공개 저장소이므로 `u-code-1029` 계정 또는 저장소 접근 권한이 있는 계정으로 로그인해야 합니다. 다른 PC에서도 같은 링크로 받을 수 있습니다.
+배포 파일은 [GitHub Releases](https://github.com/u-code-1029/SEMReview/releases)에 게시합니다. 공개 저장소이므로 GitHub 로그인 없이 다른 PC에서도 같은 링크로 받을 수 있습니다.
 
 1. NVIDIA 학습 PC에서는 `cu126` 패키지, GPU 없이 실행할 PC에서는 `cpu` 패키지를 선택합니다.
 2. ZIP을 로컬 폴더에 전부 압축 해제한 다음 `SEMReview/SEMReview.exe`를 실행합니다. 실행 파일 옆의 `_internal` 폴더도 필요합니다. Python을 따로 설치할 필요는 없습니다.
